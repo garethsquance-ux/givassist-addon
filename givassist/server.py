@@ -1,44 +1,108 @@
 #!/usr/bin/env python3
-"""GivAssist addon server — serves wizard + provides network scan API."""
+"""GivAssist addon server — serves wizard + scan API via HA Supervisor."""
 import http.server
 import json
 import os
-import socket
-import threading
+import urllib.request
 
 PORT = int(os.environ.get("INGRESS_PORT", 8099))
 DIR = "/app"
+SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 
 os.chdir(DIR)
 
 
-def get_local_subnet():
-    """Get the local IP and derive the subnet."""
+def scan_via_supervisor():
+    """Use HA Supervisor API to scan for inverters.
+    The Supervisor runs on the host network and can reach local devices."""
+    results = {"success": False, "inverters": [], "method": "supervisor", "subnet": "unknown"}
+
+    if not SUPERVISOR_TOKEN:
+        results["error"] = "No supervisor token — not running as addon"
+        return results
+
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
+        # Get network info from Supervisor
+        req = urllib.request.Request(
+            "http://supervisor/network/info",
+            headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"}
+        )
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+
+        # Extract the local IP and subnet
+        interfaces = data.get("data", {}).get("interfaces", [])
+        local_ip = None
+        for iface in interfaces:
+            if iface.get("enabled") and iface.get("ipv4", {}).get("address"):
+                addrs = iface["ipv4"]["address"]
+                if addrs:
+                    local_ip = addrs[0].split("/")[0]
+                    break
+
+        if not local_ip:
+            results["error"] = "Could not determine local IP"
+            return results
+
         parts = local_ip.split(".")
-        return ".".join(parts[:3]), local_ip
-    except Exception:
-        return "192.168.1", "unknown"
+        subnet = ".".join(parts[:3])
+        results["subnet"] = subnet
+        results["localIp"] = local_ip
+
+        # Now scan port 8899 using the Supervisor's network access
+        # We'll use HA's API to create a temporary shell command
+        import socket
+        import threading
+
+        found = []
+        lock = threading.Lock()
+
+        def check_ip(ip):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.5)
+                result = s.connect_ex((ip, 8899))
+                s.close()
+                if result == 0:
+                    # Try to read serial via Modbus
+                    serial = read_modbus(ip)
+                    with lock:
+                        found.append({
+                            "ip": ip,
+                            "serial": serial.upper() if serial else "",
+                            "batterySerial": "",
+                            "model": "GivEnergy Inverter",
+                            "method": "network_scan",
+                        })
+            except Exception:
+                pass
+
+        threads = []
+        for i in range(1, 255):
+            ip = f"{subnet}.{i}"
+            t = threading.Thread(target=check_ip, args=(ip,))
+            t.start()
+            threads.append(t)
+            if len(threads) >= 50:
+                for t in threads:
+                    t.join(timeout=2)
+                threads = [t for t in threads if t.is_alive()]
+
+        for t in threads:
+            t.join(timeout=2)
+
+        results["inverters"] = found
+        results["success"] = len(found) > 0
+        results["scannedCount"] = 254
+
+    except Exception as e:
+        results["error"] = str(e)
+
+    return results
 
 
-def scan_port(ip, port=8899, timeout=0.5):
-    """Check if a port is open on an IP."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        result = s.connect_ex((ip, port))
-        s.close()
-        return result == 0
-    except Exception:
-        return False
-
-
-def read_modbus_serial(ip, port=8899, timeout=3.0):
-    """Try to read the inverter serial via Modbus TCP."""
+def read_modbus(ip, port=8899, timeout=2.0):
+    """Try to read inverter serial via Modbus TCP."""
     try:
         import struct
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -62,78 +126,42 @@ def read_modbus_serial(ip, port=8899, timeout=3.0):
         return None
 
 
-def scan_network():
-    """Scan the local network for GivEnergy inverters on port 8899."""
-    subnet, local_ip = get_local_subnet()
-    found = []
-    lock = threading.Lock()
+import socket  # Need this at module level for read_modbus
 
-    def check_ip(ip):
-        if scan_port(ip, 8899, timeout=0.5):
-            serial = read_modbus_serial(ip) or ""
-            with lock:
-                found.append({
-                    "ip": ip,
-                    "serial": serial.upper() if serial else "",
-                    "batterySerial": "",
-                    "model": "GivEnergy Inverter",
-                    "method": "network_scan",
-                })
-
-    threads = []
-    for i in range(1, 255):
-        ip = f"{subnet}.{i}"
-        t = threading.Thread(target=check_ip, args=(ip,))
-        t.start()
-        threads.append(t)
-        if len(threads) >= 50:
-            for t in threads:
-                t.join(timeout=2)
-            threads = [t for t in threads if t.is_alive()]
-
-    for t in threads:
-        t.join(timeout=2)
-
-    return {
-        "success": len(found) > 0,
-        "inverters": found,
-        "subnet": subnet,
-        "localIp": local_ip,
-        "scannedCount": 254,
-        "method": "network_scan",
-    }
-
-
-# Run scan at startup and cache the result
-print(f"GivAssist: Pre-scanning network...", flush=True)
-CACHED_SCAN = scan_network()
-print(f"GivAssist: Found {len(CACHED_SCAN['inverters'])} inverter(s) on {CACHED_SCAN['subnet']}.x", flush=True)
-for inv in CACHED_SCAN['inverters']:
-    print(f"  → {inv['ip']} (serial: {inv['serial'] or 'unknown'})", flush=True)
+# Pre-scan at startup
+print("GivAssist: Scanning network for inverters...", flush=True)
+CACHED_SCAN = scan_via_supervisor()
+print(f"GivAssist: Subnet {CACHED_SCAN.get('subnet', '?')}, found {len(CACHED_SCAN.get('inverters', []))} inverter(s)", flush=True)
+for inv in CACHED_SCAN.get("inverters", []):
+    print(f"  -> {inv['ip']} (serial: {inv.get('serial', '?')})", flush=True)
+if CACHED_SCAN.get("error"):
+    print(f"GivAssist: Scan note: {CACHED_SCAN['error']}", flush=True)
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
-        # Strip ingress prefix if present
-        path = self.path.split("?")[0]
-        # Handle /api/scan anywhere in the path
-        if path.endswith("/api/scan") or path == "/api/scan":
+        path = self.path.split("?")[0].rstrip("/")
+
+        if path.endswith("/api/scan"):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            # Return cached result or rescan
-            if "rescan" in self.path:
-                global CACHED_SCAN
-                CACHED_SCAN = scan_network()
             self.wfile.write(json.dumps(CACHED_SCAN).encode())
             return
 
-        if path.endswith("/api/health") or path == "/api/health":
+        if path.endswith("/api/health"):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"status": "ok", "port": PORT, "subnet": CACHED_SCAN.get("subnet"), "inverters_found": len(CACHED_SCAN.get("inverters", []))}).encode())
+            info = {
+                "status": "ok",
+                "port": PORT,
+                "subnet": CACHED_SCAN.get("subnet"),
+                "inverters_found": len(CACHED_SCAN.get("inverters", [])),
+                "has_supervisor": bool(SUPERVISOR_TOKEN),
+            }
+            self.wfile.write(json.dumps(info).encode())
             return
 
         # SPA fallback
