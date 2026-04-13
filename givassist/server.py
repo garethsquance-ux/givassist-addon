@@ -5,7 +5,6 @@ import json
 import os
 import socket
 import threading
-import struct
 
 PORT = int(os.environ.get("INGRESS_PORT", 8099))
 DIR = "/app"
@@ -26,7 +25,7 @@ def get_local_subnet():
         return "192.168.1", "unknown"
 
 
-def scan_port(ip, port=8899, timeout=1.0):
+def scan_port(ip, port=8899, timeout=0.5):
     """Check if a port is open on an IP."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -39,31 +38,24 @@ def scan_port(ip, port=8899, timeout=1.0):
 
 
 def read_modbus_serial(ip, port=8899, timeout=3.0):
-    """Try to read the inverter serial via Modbus TCP register."""
+    """Try to read the inverter serial via Modbus TCP."""
     try:
+        import struct
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
         s.connect((ip, port))
-
-        # Modbus TCP: read holding registers starting at register 0, count 6
-        # Transaction ID (2) + Protocol (2) + Length (2) + Unit (1) + Function (1) + Start (2) + Count (2)
         request = struct.pack(">HHHBBHH", 1, 0, 6, 0, 3, 0, 6)
         s.send(request)
         response = s.recv(256)
         s.close()
-
         if len(response) > 9:
-            # Parse the register data as ASCII characters
             data = response[9:]
             serial = ""
             for i in range(0, min(len(data), 12), 2):
                 if i + 1 < len(data):
-                    c1 = data[i]
-                    c2 = data[i + 1]
-                    if 32 <= c1 < 127:
-                        serial += chr(c1)
-                    if 32 <= c2 < 127:
-                        serial += chr(c2)
+                    c1, c2 = data[i], data[i + 1]
+                    if 32 <= c1 < 127: serial += chr(c1)
+                    if 32 <= c2 < 127: serial += chr(c2)
             return serial.strip() if serial.strip() else None
         return None
     except Exception:
@@ -74,74 +66,79 @@ def scan_network():
     """Scan the local network for GivEnergy inverters on port 8899."""
     subnet, local_ip = get_local_subnet()
     found = []
-    scanned = 0
-
-    # Scan common IP ranges first (faster discovery)
-    ips_to_scan = []
-    for i in range(1, 255):
-        ips_to_scan.append(f"{subnet}.{i}")
+    lock = threading.Lock()
 
     def check_ip(ip):
-        nonlocal scanned
         if scan_port(ip, 8899, timeout=0.5):
             serial = read_modbus_serial(ip) or ""
-            found.append({
-                "ip": ip,
-                "serial": serial.upper() if serial else "",
-                "batterySerial": "",
-                "model": "GivEnergy Inverter",
-                "method": "network_scan",
-            })
-        scanned += 1
+            with lock:
+                found.append({
+                    "ip": ip,
+                    "serial": serial.upper() if serial else "",
+                    "batterySerial": "",
+                    "model": "GivEnergy Inverter",
+                    "method": "network_scan",
+                })
 
-    # Scan in parallel threads (fast)
     threads = []
-    for ip in ips_to_scan:
+    for i in range(1, 255):
+        ip = f"{subnet}.{i}"
         t = threading.Thread(target=check_ip, args=(ip,))
         t.start()
         threads.append(t)
-        # Limit concurrent threads
         if len(threads) >= 50:
             for t in threads:
-                t.join()
-            threads = []
+                t.join(timeout=2)
+            threads = [t for t in threads if t.is_alive()]
 
     for t in threads:
-        t.join()
+        t.join(timeout=2)
 
     return {
         "success": len(found) > 0,
         "inverters": found,
         "subnet": subnet,
         "localIp": local_ip,
-        "scannedCount": scanned,
+        "scannedCount": 254,
         "method": "network_scan",
     }
 
 
+# Run scan at startup and cache the result
+print(f"GivAssist: Pre-scanning network...", flush=True)
+CACHED_SCAN = scan_network()
+print(f"GivAssist: Found {len(CACHED_SCAN['inverters'])} inverter(s) on {CACHED_SCAN['subnet']}.x", flush=True)
+for inv in CACHED_SCAN['inverters']:
+    print(f"  → {inv['ip']} (serial: {inv['serial'] or 'unknown'})", flush=True)
+
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
-        # API endpoint: scan network for inverters
-        if self.path == "/api/scan" or self.path.startswith("/api/scan?"):
+        # Strip ingress prefix if present
+        path = self.path.split("?")[0]
+        # Handle /api/scan anywhere in the path
+        if path.endswith("/api/scan") or path == "/api/scan":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
-            result = scan_network()
-            self.wfile.write(json.dumps(result).encode())
+            # Return cached result or rescan
+            if "rescan" in self.path:
+                global CACHED_SCAN
+                CACHED_SCAN = scan_network()
+            self.wfile.write(json.dumps(CACHED_SCAN).encode())
             return
 
-        # API endpoint: health check
-        if self.path == "/api/health":
+        if path.endswith("/api/health") or path == "/api/health":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"status": "ok", "port": PORT}).encode())
+            self.wfile.write(json.dumps({"status": "ok", "port": PORT, "subnet": CACHED_SCAN.get("subnet"), "inverters_found": len(CACHED_SCAN.get("inverters", []))}).encode())
             return
 
         # SPA fallback
-        path = self.translate_path(self.path)
-        if not os.path.exists(path) or os.path.isdir(path):
+        translated = self.translate_path(self.path)
+        if not os.path.exists(translated) or os.path.isdir(translated):
             self.path = "/index.html"
         return super().do_GET()
 
@@ -150,5 +147,4 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 
 print(f"GivAssist Wizard listening on port {PORT}", flush=True)
-print(f"Network scan available at /api/scan", flush=True)
 http.server.HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
