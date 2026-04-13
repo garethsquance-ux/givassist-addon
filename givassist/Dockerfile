@@ -3,10 +3,9 @@ FROM ${BUILD_FROM}
 
 RUN apk add --no-cache python3
 
-RUN mkdir -p /app /etc/services.d/givassist
+RUN mkdir -p /app
 
 COPY rootfs/app/ /app/
 COPY server.py /server.py
 
-RUN printf '#!/usr/bin/with-contenv bashio\nbashio::log.info "GivAssist starting on port ${INGRESS_PORT:-8099}"\nexec python3 /server.py\n' > /etc/services.d/givassist/run \
-    && chmod +x /etc/services.d/givassist/run
+CMD ["python3", "/server.py"]
