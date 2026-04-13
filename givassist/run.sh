@@ -1,6 +1,3 @@
 #!/bin/sh
-
-echo "Starting GivAssist Wizard..."
-
-# Start nginx
+echo "GivAssist starting..."
 nginx -g 'daemon off;'
