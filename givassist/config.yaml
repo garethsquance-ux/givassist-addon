@@ -1,6 +1,6 @@
 name: "GivAssist"
 description: "Plug-and-play setup wizard for GivEnergy solar and battery systems. Auto-configures smart charging, battery protection, Telegram control, and dashboards."
-version: "1.0.2"
+version: "1.0.3"
 slug: "givassist"
 url: "https://givassist.agent2027.ai"
 arch:
