@@ -1,0 +1,5 @@
+* text=auto
+*.sh text eol=lf
+rootfs/etc/services.d/givassist/run text eol=lf
+rootfs/etc/services.d/givassist/finish text eol=lf
+Dockerfile text eol=lf
