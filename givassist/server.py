@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""GivAssist addon server — serves wizard + scan API via HA Supervisor."""
+"""GivAssist addon server — serves wizard + orchestrates GivTCP install."""
 import http.server
 import json
 import os
+import time
 import urllib.request
 
 PORT = int(os.environ.get("INGRESS_PORT", 8099))
@@ -11,157 +12,175 @@ SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 
 os.chdir(DIR)
 
+GIVTCP_REPO = "https://github.com/britkat1980/ha-addons"
+GIVTCP_SLUG = "c6a2317c_givtcp"  # Hashed repo prefix + slug
+MOSQUITTO_SLUG = "core_mosquitto"
 
-def scan_via_supervisor():
-    """Use HA Supervisor API to scan for inverters.
-    The Supervisor runs on the host network and can reach local devices."""
-    results = {"success": False, "inverters": [], "method": "supervisor", "subnet": "unknown"}
 
+def supervisor_request(path, method="GET", data=None):
+    """Make a request to the HA Supervisor API."""
     if not SUPERVISOR_TOKEN:
-        results["error"] = "No supervisor token — not running as addon"
-        return results
-
+        return None, "No supervisor token"
+    url = f"http://supervisor/{path}"
+    headers = {"Authorization": f"Bearer {SUPERVISOR_TOKEN}", "Content-Type": "application/json"}
     try:
-        # Get network info from Supervisor
-        req = urllib.request.Request(
-            "http://supervisor/network/info",
-            headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"}
-        )
-        resp = urllib.request.urlopen(req, timeout=5)
-        data = json.loads(resp.read())
-
-        # Extract the local IP and subnet
-        interfaces = data.get("data", {}).get("interfaces", [])
-        local_ip = None
-        for iface in interfaces:
-            if iface.get("enabled") and iface.get("ipv4", {}).get("address"):
-                addrs = iface["ipv4"]["address"]
-                if addrs:
-                    local_ip = addrs[0].split("/")[0]
-                    break
-
-        if not local_ip:
-            results["error"] = "Could not determine local IP"
-            return results
-
-        parts = local_ip.split(".")
-        subnet = ".".join(parts[:3])
-        results["subnet"] = subnet
-        results["localIp"] = local_ip
-
-        # Now scan port 8899 using the Supervisor's network access
-        # We'll use HA's API to create a temporary shell command
-        import socket
-        import threading
-
-        found = []
-        lock = threading.Lock()
-
-        def check_ip(ip):
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(0.5)
-                result = s.connect_ex((ip, 8899))
-                s.close()
-                if result == 0:
-                    # Try to read serial via Modbus
-                    serial = read_modbus(ip)
-                    with lock:
-                        found.append({
-                            "ip": ip,
-                            "serial": serial.upper() if serial else "",
-                            "batterySerial": "",
-                            "model": "GivEnergy Inverter",
-                            "method": "network_scan",
-                        })
-            except Exception:
-                pass
-
-        threads = []
-        for i in range(1, 255):
-            ip = f"{subnet}.{i}"
-            t = threading.Thread(target=check_ip, args=(ip,))
-            t.start()
-            threads.append(t)
-            if len(threads) >= 50:
-                for t in threads:
-                    t.join(timeout=2)
-                threads = [t for t in threads if t.is_alive()]
-
-        for t in threads:
-            t.join(timeout=2)
-
-        results["inverters"] = found
-        results["success"] = len(found) > 0
-        results["scannedCount"] = 254
-
+        body = json.dumps(data).encode() if data else None
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        resp = urllib.request.urlopen(req, timeout=30)
+        return json.loads(resp.read()), None
+    except urllib.error.HTTPError as e:
+        return None, f"HTTP {e.code}: {e.read().decode()}"
     except Exception as e:
-        results["error"] = str(e)
-
-    return results
+        return None, str(e)
 
 
-def read_modbus(ip, port=8899, timeout=2.0):
-    """Try to read inverter serial via Modbus TCP."""
-    try:
-        import struct
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((ip, port))
-        request = struct.pack(">HHHBBHH", 1, 0, 6, 0, 3, 0, 6)
-        s.send(request)
-        response = s.recv(256)
-        s.close()
-        if len(response) > 9:
-            data = response[9:]
-            serial = ""
-            for i in range(0, min(len(data), 12), 2):
-                if i + 1 < len(data):
-                    c1, c2 = data[i], data[i + 1]
-                    if 32 <= c1 < 127: serial += chr(c1)
-                    if 32 <= c2 < 127: serial += chr(c2)
-            return serial.strip() if serial.strip() else None
-        return None
-    except Exception:
-        return None
+def add_repository(repo_url):
+    """Add a third-party addon repository."""
+    # Get current repos
+    data, err = supervisor_request("store")
+    if err:
+        return False, err
+
+    # Check if already added
+    repos = data.get("data", {}).get("repositories", [])
+    for r in repos:
+        if r.get("url", "") == repo_url or r.get("source", "") == repo_url:
+            return True, "Already added"
+
+    # Add it
+    _, err = supervisor_request("store/repositories", method="POST", data={"repository": repo_url})
+    if err:
+        return False, err
+    return True, "Added"
 
 
-import socket  # Need this at module level for read_modbus
+def install_addon(slug):
+    """Install an addon by slug."""
+    # Check if already installed
+    data, err = supervisor_request(f"addons/{slug}/info")
+    if not err and data:
+        state = data.get("data", {}).get("state", "")
+        if state == "started":
+            return True, "already_running"
+        if state == "stopped":
+            # Start it
+            supervisor_request(f"addons/{slug}/start", method="POST")
+            return True, "started"
 
-# Pre-scan at startup
-print("GivAssist: Scanning network for inverters...", flush=True)
-CACHED_SCAN = scan_via_supervisor()
-print(f"GivAssist: Subnet {CACHED_SCAN.get('subnet', '?')}, found {len(CACHED_SCAN.get('inverters', []))} inverter(s)", flush=True)
-for inv in CACHED_SCAN.get("inverters", []):
-    print(f"  -> {inv['ip']} (serial: {inv.get('serial', '?')})", flush=True)
-if CACHED_SCAN.get("error"):
-    print(f"GivAssist: Scan note: {CACHED_SCAN['error']}", flush=True)
+    # Not installed — install it
+    _, err = supervisor_request(f"addons/{slug}/install", method="POST")
+    if err:
+        return False, err
+
+    # Wait for install
+    for _ in range(60):
+        time.sleep(2)
+        data, _ = supervisor_request(f"addons/{slug}/info")
+        if data and data.get("data", {}).get("state"):
+            break
+
+    # Start it
+    supervisor_request(f"addons/{slug}/start", method="POST")
+    return True, "installed"
+
+
+def get_givtcp_entities():
+    """Read GivTCP entities from HA to find discovered inverters."""
+    data, err = supervisor_request("core/api/states")
+    if err:
+        return [], err
+
+    states = data if isinstance(data, list) else []
+    # If supervisor wraps in {data: ...}
+    if isinstance(data, dict) and "data" in data:
+        states = data["data"] if isinstance(data["data"], list) else []
+
+    inverters = []
+    seen_serials = set()
+    for state in states:
+        eid = state.get("entity_id", "")
+        if not eid.startswith("sensor.givtcp"):
+            continue
+        if not eid.endswith("_soc"):
+            continue
+        # Extract serial: sensor.givtcp_fd2249g811_soc -> fd2249g811
+        # or sensor.givtcp2_fd2320f456_soc -> fd2320f456
+        parts = eid.replace("sensor.", "").split("_")
+        # Remove givtcp prefix (givtcp, givtcp2, givtcp3)
+        prefix = parts[0]
+        serial_parts = parts[1:-1]  # Remove first (givtcp) and last (soc)
+        serial = "_".join(serial_parts).upper()
+
+        if serial and serial not in seen_serials:
+            seen_serials.add(serial)
+            # Try to find the IP from invertor_ip entity
+            ip = ""
+            for s2 in states:
+                if serial.lower() in s2.get("entity_id", "") and "invertor_ip" in s2.get("entity_id", ""):
+                    ip = s2.get("state", "")
+                    break
+            inverters.append({
+                "serial": serial,
+                "ip": ip,
+                "batterySerial": "",
+                "prefix": prefix,
+            })
+
+    return inverters, None
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/")
 
-        if path.endswith("/api/scan"):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(json.dumps(CACHED_SCAN).encode())
+        if path.endswith("/api/health"):
+            self.json_response({"status": "ok", "port": PORT, "has_supervisor": bool(SUPERVISOR_TOKEN)})
             return
 
-        if path.endswith("/api/health"):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            info = {
-                "status": "ok",
-                "port": PORT,
-                "subnet": CACHED_SCAN.get("subnet"),
-                "inverters_found": len(CACHED_SCAN.get("inverters", [])),
-                "has_supervisor": bool(SUPERVISOR_TOKEN),
-            }
-            self.wfile.write(json.dumps(info).encode())
+        if path.endswith("/api/setup/status"):
+            """Check what's installed and what GivTCP has found."""
+            result = {"mosquitto": False, "givtcp": False, "inverters": []}
+
+            # Check Mosquitto
+            data, _ = supervisor_request(f"addons/{MOSQUITTO_SLUG}/info")
+            if data and data.get("data", {}).get("state") == "started":
+                result["mosquitto"] = True
+
+            # Check GivTCP
+            data, _ = supervisor_request(f"addons/{GIVTCP_SLUG}/info")
+            if data:
+                state = data.get("data", {}).get("state", "")
+                result["givtcp"] = state == "started"
+                result["givtcp_state"] = state
+
+            # Get discovered inverters
+            if result["givtcp"]:
+                inverters, _ = get_givtcp_entities()
+                result["inverters"] = inverters
+
+            self.json_response(result)
+            return
+
+        if path.endswith("/api/setup/install"):
+            """Install Mosquitto + GivTCP repo + GivTCP addon."""
+            steps = []
+
+            # Step 1: Mosquitto
+            ok, msg = install_addon(MOSQUITTO_SLUG)
+            steps.append({"step": "mosquitto", "ok": ok, "msg": msg})
+
+            # Step 2: Add GivTCP repo
+            ok, msg = add_repository(GIVTCP_REPO)
+            steps.append({"step": "givtcp_repo", "ok": ok, "msg": msg})
+
+            # Step 3: Install GivTCP
+            if ok:
+                # Need to wait a moment for the repo to be processed
+                time.sleep(3)
+                ok, msg = install_addon(GIVTCP_SLUG)
+                steps.append({"step": "givtcp_install", "ok": ok, "msg": msg})
+
+            self.json_response({"steps": steps, "success": all(s["ok"] for s in steps)})
             return
 
         # SPA fallback
@@ -170,9 +189,46 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.path = "/index.html"
         return super().do_GET()
 
+    def do_POST(self):
+        path = self.path.split("?")[0].rstrip("/")
+
+        if path.endswith("/api/setup/install"):
+            # Same as GET for simplicity
+            self.do_GET()
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def json_response(self, data, status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
     def log_message(self, format, *args):
         pass
 
 
 print(f"GivAssist Wizard listening on port {PORT}", flush=True)
+print(f"Supervisor token: {'present' if SUPERVISOR_TOKEN else 'MISSING'}", flush=True)
+
+# Check current state at startup
+if SUPERVISOR_TOKEN:
+    print("GivAssist: Checking current setup state...", flush=True)
+    data, err = supervisor_request(f"addons/{MOSQUITTO_SLUG}/info")
+    mqtt_running = data and data.get("data", {}).get("state") == "started" if data else False
+    print(f"  Mosquitto: {'running' if mqtt_running else 'not installed'}", flush=True)
+
+    data, err = supervisor_request(f"addons/{GIVTCP_SLUG}/info")
+    givtcp_state = data.get("data", {}).get("state", "not installed") if data else "not installed"
+    print(f"  GivTCP: {givtcp_state}", flush=True)
+
+    if givtcp_state == "started":
+        inverters, _ = get_givtcp_entities()
+        print(f"  Inverters found: {len(inverters)}", flush=True)
+        for inv in inverters:
+            print(f"    -> {inv['serial']} at {inv.get('ip', '?')}", flush=True)
+
 http.server.HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
