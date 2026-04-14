@@ -1,6 +1,6 @@
 name: "GivAssist"
 description: "Plug-and-play setup wizard for GivEnergy solar and battery systems. Auto-configures smart charging, battery protection, Telegram control, and dashboards."
-version: "2.0.0"
+version: "2.0.1"
 slug: "givassist"
 url: "https://givassist.agent2027.ai"
 arch:
@@ -17,6 +17,7 @@ ingress_port: 8099
 panel_icon: "mdi:solar-power"
 panel_title: "GivAssist"
 homeassistant_api: true
+hassio_api: true
 auth_api: true
 options: {}
 schema: {}
