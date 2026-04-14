@@ -13,7 +13,7 @@ SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 os.chdir(DIR)
 
 GIVTCP_REPO = "https://github.com/britkat1980/ha-addons"
-GIVTCP_SLUG = "c6a2317c_givtcp"  # Hashed repo prefix + slug
+GIVTCP_SLUG = "533ea71a_givtcp"  # Hashed repo prefix + slug
 MOSQUITTO_SLUG = "core_mosquitto"
 
 
